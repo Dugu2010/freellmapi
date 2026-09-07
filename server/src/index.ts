@@ -11,7 +11,7 @@ import { installProcessSafetyNet } from './lib/process-safety-net.js';
 import { NodeScheduler } from './lib/scheduler.js';
 import { loadConfig } from './lib/config.js';
 import { applyDeclarativeConfigFromEnv } from './services/declarative-config.js';
-import { restoreDbBackupIfNeeded, startDbBackupPump } from './lib/db-backup.js';
+import { restoreDbBackup, startDbBackup } from './services/dbBackup.js';
 import { startBackupScheduler } from './services/backups.js';
 import { userCount } from './services/auth.js';
 import { generateSetupCode } from './lib/setup-code.js';
@@ -37,11 +37,8 @@ async function main() {
 
   const scheduler = new NodeScheduler();
 
-  if (config.dbPath) {
-    await restoreDbBackupIfNeeded(config.dbPath);
-  } else {
-    await restoreDbBackupIfNeeded();
-  }
+  // Restore the Extended/Filebase backup before opening SQLite.
+  await restoreDbBackup();
   initDb(config.dbPath ?? undefined);
   applyDeclarativeConfigFromEnv();
   // After initDb: the unknown-model half of this check reads the catalog.
@@ -82,7 +79,7 @@ async function main() {
     startHealthChecker(scheduler);
     startCatalogSync(scheduler);
     startCooldownProbe(scheduler);
-    startDbBackupPump(getDb(), scheduler, config.dbPath ?? undefined);
+    startDbBackup();
     startBackupScheduler(scheduler);
     startCustomModelSync(getDb(), scheduler);
 

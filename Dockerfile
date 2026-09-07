@@ -19,7 +19,9 @@ COPY server/package.json ./server/
 COPY client/package.json ./client/
 COPY cli/package.json ./cli/
 
-RUN npm ci
+# The lockfile predates the Filebase S3 dependency. Use npm install here so the
+# dependency graph is reconciled from package.json during the image build.
+RUN npm install
 
 FROM deps AS build
 WORKDIR /app

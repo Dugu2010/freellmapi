@@ -128,7 +128,11 @@ async function createAndUploadBackup(): Promise<void> {
   if (!cfg) return;
   const tempPath = `${DB_PATH}.backup-${process.pid}`;
   try {
-    await getDb().backup(tempPath);
+    const db = getDb() as typeof getDb extends () => infer T ? T & { backup(path: string): Promise<unknown> } : never;
+    if (typeof db.backup !== 'function') {
+      throw new Error('Database driver does not support SQLite backup().');
+    }
+    await db.backup(tempPath);
     const sqliteFile = await fs.readFile(tempPath);
     await uploadBackup(cfg, await encryptBackup(sqliteFile, cfg.key));
     console.log('[db-backup] Filebase backup uploaded.');

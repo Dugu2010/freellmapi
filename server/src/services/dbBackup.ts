@@ -1,125 +1,154 @@
-import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
-import { gzipSync, gunzipSync } from 'node:zlib';
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
-import fs from 'node:fs';
+import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
 import path from 'node:path';
+import zlib from 'node:zlib';
+import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import type Database from 'better-sqlite3';
+import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getDb } from '../db/index.js';
 
+const gzip = promisify(zlib.gzip);
+const gunzip = promisify(zlib.gunzip);
+const ALGORITHM = 'aes-256-gcm';
+const MAGIC = Buffer.from('FREEAPI-BACKUP-V1\n', 'utf8');
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DEFAULT_DB_PATH = path.resolve(__dirname, '../../data/freellmapi.db');
-const BACKUP_MAGIC = Buffer.from('FREEAPI-BACKUP-V1\n', 'utf8');
+const DB_PATH = path.resolve(__dirname, '../../data/freeapi.db');
 
-function key(): Buffer {
-  const value = process.env.FREEAPI_DB_BACKUP_KEY || process.env.ENCRYPTION_KEY;
-  if (!value) throw new Error('FREEAPI_DB_BACKUP_KEY or ENCRYPTION_KEY is required for DB backup');
-  return /^[0-9a-fA-F]{64}$/.test(value) ? Buffer.from(value, 'hex') : createHash('sha256').update(value).digest();
-}
-
-function backupPath(): string {
-  return process.env.FREEAPI_DB_BACKUP_PATH?.trim() || path.resolve(path.dirname(dbPath()), 'freellmapi.db.backup');
-}
-
-function dbPath(): string {
-  return process.env.FREEAPI_DB_PATH?.trim() || DEFAULT_DB_PATH;
-}
-
-function encrypt(data: Buffer): Buffer {
-  const nonce = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', key(), nonce);
-  const ciphertext = Buffer.concat([cipher.update(data), cipher.final()]);
-  return Buffer.concat([BACKUP_MAGIC, nonce, cipher.getAuthTag(), ciphertext]);
-}
-
-function decrypt(data: Buffer): Buffer {
-  if (!data.subarray(0, BACKUP_MAGIC.length).equals(BACKUP_MAGIC)) throw new Error('Invalid backup format');
-  const offset = BACKUP_MAGIC.length;
-  const nonce = data.subarray(offset, offset + 12);
-  const tag = data.subarray(offset + 12, offset + 28);
-  const ciphertext = data.subarray(offset + 28);
-  const decipher = createDecipheriv('aes-256-gcm', key(), nonce);
-  decipher.setAuthTag(tag);
-  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-}
-
-function objectKey(): string { return process.env.FILEBASE_OBJECT_KEY?.trim() || 'freellmapi.db.backup'; }
-
-function s3Client(): S3Client {
-  const endpoint = process.env.FILEBASE_ENDPOINT?.trim();
-  const region = process.env.FILEBASE_REGION?.trim() || 'us-east-1';
-  return new S3Client({
-    region,
-    endpoint,
-    forcePathStyle: true,
-    credentials: {
-      accessKeyId: process.env.FILEBASE_ACCESS_KEY || '',
-      secretAccessKey: process.env.FILEBASE_SECRET_KEY || '',
-    },
-  });
-}
-
-function filebaseConfigured(): boolean {
-  return Boolean(process.env.FILEBASE_ACCESS_KEY && process.env.FILEBASE_SECRET_KEY && process.env.FILEBASE_BUCKET);
-}
-
-async function downloadBackup(): Promise<Buffer | null> {
-  if (filebaseConfigured()) {
-    const response = await s3Client().send(new GetObjectCommand({ Bucket: process.env.FILEBASE_BUCKET, Key: objectKey() }));
-    if (!response.Body) return null;
-    return Buffer.from(await response.Body.transformToByteArray());
+function config() {
+  const accessKeyId = process.env.FILEBASE_ACCESS_KEY?.trim();
+  const secretAccessKey = process.env.FILEBASE_SECRET_KEY?.trim();
+  const bucket = process.env.FILEBASE_BUCKET?.trim();
+  const keyHex = process.env.FREEAPI_DB_BACKUP_KEY?.trim();
+  if (!accessKeyId || !secretAccessKey || !bucket || !keyHex) return null;
+  if (!/^[0-9a-fA-F]{64}$/.test(keyHex)) {
+    throw new Error('Invalid FREEAPI_DB_BACKUP_KEY: expected exactly 64 hex chars (32 bytes).');
   }
-  const target = backupPath();
-  if (!fs.existsSync(target)) return null;
-  return fs.readFileSync(target);
+  const interval = Number(process.env.FREEAPI_DB_BACKUP_INTERVAL_MS ?? 300000);
+  return {
+    bucket,
+    objectKey: process.env.FILEBASE_OBJECT_KEY?.trim() || 'freeapi/freeapi.db.enc.gz',
+    key: Buffer.from(keyHex, 'hex'),
+    intervalMs: Number.isFinite(interval) && interval >= 60000 ? interval : 300000,
+    client: new S3Client({
+      region: process.env.FILEBASE_REGION?.trim() || 'us-east-1',
+      endpoint: process.env.FILEBASE_ENDPOINT?.trim() || 'https://s3.filebase.io',
+      forcePathStyle: true,
+      credentials: { accessKeyId, secretAccessKey },
+    }),
+  };
 }
 
-async function uploadBackup(payload: Buffer): Promise<void> {
-  if (filebaseConfigured()) {
-    await s3Client().send(new PutObjectCommand({
-      Bucket: process.env.FILEBASE_BUCKET,
-      Key: objectKey(),
-      Body: payload,
-      ContentType: 'application/octet-stream',
+type BackupConfig = NonNullable<ReturnType<typeof config>>;
+
+async function encryptBackup(data: Buffer, key: Buffer): Promise<Buffer> {
+  const compressed = await gzip(data, { level: 9 });
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
+  const encrypted = Buffer.concat([cipher.update(compressed), cipher.final()]);
+  return Buffer.concat([MAGIC, iv, cipher.getAuthTag(), encrypted]);
+}
+
+async function decryptBackup(data: Buffer, key: Buffer): Promise<Buffer> {
+  const headerLength = MAGIC.length + 12 + 16;
+  if (data.length <= headerLength || !data.subarray(0, MAGIC.length).equals(MAGIC)) {
+    throw new Error('Invalid or unsupported database backup format.');
+  }
+  const ivStart = MAGIC.length;
+  const tagStart = ivStart + 12;
+  const encryptedStart = tagStart + 16;
+  const decipher = crypto.createDecipheriv(ALGORITHM, key, data.subarray(ivStart, tagStart));
+  decipher.setAuthTag(data.subarray(tagStart, encryptedStart));
+  const compressed = Buffer.concat([
+    decipher.update(data.subarray(encryptedStart)),
+    decipher.final(),
+  ]);
+  return gunzip(compressed);
+}
+
+async function bodyToBuffer(body: unknown): Promise<Buffer> {
+  if (!body) throw new Error('Backup object has an empty body.');
+  if (body instanceof Uint8Array) return Buffer.from(body);
+  if (typeof body === 'object' && body !== null && 'transformToByteArray' in body) {
+    const bytes = await (body as { transformToByteArray: () => Promise<Uint8Array> }).transformToByteArray();
+    return Buffer.from(bytes);
+  }
+  const chunks: Buffer[] = [];
+  for await (const chunk of body as AsyncIterable<Uint8Array>) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+async function downloadBackup(cfg: BackupConfig): Promise<Buffer | null> {
+  try {
+    const response = await cfg.client.send(new GetObjectCommand({
+      Bucket: cfg.bucket,
+      Key: cfg.objectKey,
     }));
-    return;
+    return bodyToBuffer(response.Body);
+  } catch (error) {
+    const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
+    const name = (error as { name?: string }).name;
+    if (status === 404 || name === 'NoSuchKey' || name === 'NotFound') return null;
+    throw error;
   }
-  fs.mkdirSync(path.dirname(backupPath()), { recursive: true });
-  fs.writeFileSync(backupPath(), payload, { mode: 0o600 });
+}
+
+async function uploadBackup(cfg: BackupConfig, payload: Buffer): Promise<void> {
+  await cfg.client.send(new PutObjectCommand({
+    Bucket: cfg.bucket,
+    Key: cfg.objectKey,
+    Body: payload,
+    ContentType: 'application/octet-stream',
+  }));
 }
 
 export async function restoreDbBackup(): Promise<void> {
-  if (fs.existsSync(dbPath())) return;
+  const cfg = config();
+  if (!cfg) return;
+
+  const backup = await downloadBackup(cfg);
+  if (!backup) {
+    console.log('[db-backup] No remote backup found; starting with local DB.');
+    return;
+  }
+
+  await fs.mkdir(path.dirname(DB_PATH), { recursive: true });
+  const tempPath = `${DB_PATH}.restore-${process.pid}`;
   try {
-    const encrypted = await downloadBackup();
-    if (!encrypted) return;
-    const plain = gunzipSync(decrypt(encrypted));
-    fs.mkdirSync(path.dirname(dbPath()), { recursive: true });
-    fs.writeFileSync(dbPath(), plain, { mode: 0o600 });
-    console.log('Database restored from backup');
+    await fs.writeFile(tempPath, await decryptBackup(backup, cfg.key), { mode: 0o600 });
+    await fs.rename(tempPath, DB_PATH);
+    console.log('[db-backup] Restored database from Filebase.');
   } catch (error) {
-    console.warn('Database backup restore skipped:', error);
+    await fs.rm(tempPath, { force: true }).catch(() => undefined);
+    throw new Error(`[db-backup] Restore failed; refusing to start with an unverified database: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
-export async function backupDb(): Promise<void> {
+async function createAndUploadBackup(): Promise<void> {
+  const cfg = config();
+  if (!cfg) return;
+  const tempPath = `${DB_PATH}.backup-${process.pid}`;
   try {
-    const db: Database.Database = getDb();
-    const temp = `${dbPath()}.backup.tmp`;
-    await db.backup(temp);
-    const plain = fs.readFileSync(temp);
-    fs.rmSync(temp, { force: true });
-    await uploadBackup(encrypt(gzipSync(plain)));
-    console.log('Database backup uploaded');
+    await getDb().backup(tempPath);
+    const sqliteFile = await fs.readFile(tempPath);
+    await uploadBackup(cfg, await encryptBackup(sqliteFile, cfg.key));
+    console.log('[db-backup] Filebase backup uploaded.');
   } catch (error) {
-    console.warn('Database backup failed:', error);
+    console.error('[db-backup] Backup failed:', error);
+  } finally {
+    await fs.rm(tempPath, { force: true }).catch(() => undefined);
   }
 }
 
 export function startDbBackup(): void {
-  const interval = Number(process.env.FREEAPI_DB_BACKUP_INTERVAL_MS || 300000);
-  if (!Number.isFinite(interval) || interval <= 0) return;
-  void backupDb();
-  const timer = setInterval(() => void backupDb(), interval);
+  const cfg = config();
+  if (!cfg) {
+    console.log('[db-backup] Filebase persistence disabled (Filebase + backup env vars not configured).');
+    return;
+  }
+  setTimeout(() => void createAndUploadBackup(), 5000);
+  const timer = setInterval(() => void createAndUploadBackup(), cfg.intervalMs);
   timer.unref?.();
+  const shutdown = () => void createAndUploadBackup();
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
 }
